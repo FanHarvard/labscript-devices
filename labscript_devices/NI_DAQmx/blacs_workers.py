@@ -764,14 +764,14 @@ class NI_DAQmxCounterWorker(Worker):
             self.buffered_chans.append(instruction["connection"])
             self.data_buffer.append(np.zeros((instruction["buffer_size"],), dtype=np.uint32))
             self.daq_status.append({})
-            self.data_saver.append(
-                DataSaver(
-                    self.h5_file,
-                    device_name=self.device_name,
-                    acquisition_type="count",
-                    data_label=instruction["label"]
-                )
+            saver = DataSaver(
+                self.h5_file,
+                device_name=self.device_name,
+                acquisition_type="count",
+                data_label=instruction["label"]
             )
+            saver.open_for_writing()
+            self.data_saver.append(saver)
         
         self.buffered_mode = True
         self._start_task(self.instructions)
@@ -791,6 +791,7 @@ class NI_DAQmxCounterWorker(Worker):
                 status["aborted"] = True
 
         for data_saver, daq_status in zip(self.data_saver, self.daq_status):
+            data_saver.close_data_file()
             data_saver.add_attribute("daq_status", json.dumps(daq_status))
             data_saver.merge_into_shot(cleanup=not abort)
 
@@ -852,7 +853,16 @@ class NI_DAQmxCounterWorker(Worker):
                 data = np.array(self.data_buffer[i_task][:samples_read], copy=True)
                 saver = self.data_saver[i_task]
                 ds_name = "data"
-                with saver.open_data_file() as f:
+                is_data_saved = False
+                while not is_data_saved:
+                    f = saver.get_open_file()
+                    if f is None and not saver.open_for_writing():
+                        time.sleep(interval)
+                        continue
+                    f = saver.get_open_file()
+                    if f is None:
+                        time.sleep(interval)
+                        continue
                     if ds_name not in f:
                         f.create_dataset(
                             ds_name,
@@ -866,6 +876,7 @@ class NI_DAQmxCounterWorker(Worker):
                         old_len = ds.shape[0]
                         ds.resize((old_len + samples_read,))
                         ds[old_len:] = data
+                    is_data_saved = True
 
             if samples_read > 0 and self.online_monitor:
                 dummy_interval = interval * 1e9 / samples_read # in nanoseconds
