@@ -772,19 +772,24 @@ class NI_DAQmxCounterWorker(Worker):
                     data_label=instruction["label"]
                 )
             )
+            self.data_saver[-1].open_for_writing()
         
         self.buffered_mode = True
         self._start_task(self.instructions)
 
+        print("[NI_DAQmxCounterWorker] finished transition_to_buffered")
+
         return {}
 
     def transition_to_manual(self, abort=False):
-        self.logger.debug('transition_to_manual')
+        self.logger.debug('[CounterWorker] transition_to_manual')
 
         if not self.buffered_mode:
             return True
         if len(self.buffered_chans) > 0:
             self._stop_task()
+
+        self.logger.debug('[CounterWorker] task stopped')
 
         if abort:
             for status in self.daq_status:
@@ -792,7 +797,10 @@ class NI_DAQmxCounterWorker(Worker):
 
         for data_saver, daq_status in zip(self.data_saver, self.daq_status):
             data_saver.add_attribute("daq_status", json.dumps(daq_status))
-            data_saver.merge_into_shot(cleanup=not abort)
+            self.logger.debug(f"[CounterWorker] Close data file of {data_saver.data_label}")
+            data_saver.close_data_file()
+            self.logger.debug(f"[CounterWorker] Merge data in {data_saver.data_label} to the shot file")
+            data_saver.merge_into_shot()
 
         self.buffered_mode = False
         self.h5_file = None
@@ -848,11 +856,21 @@ class NI_DAQmxCounterWorker(Worker):
                 self.daq_status[i_task],
             )
 
-            if samples_read > 0 and self.data_saver:
+            if samples_read > 0:
                 data = np.array(self.data_buffer[i_task][:samples_read], copy=True)
                 saver = self.data_saver[i_task]
                 ds_name = "data"
-                with saver.open_data_file() as f:
+
+                data_save_succeeded = False
+                max_trial = 8
+                wait_interval_between_trial = 0.05
+                trial = 0
+                while not data_save_succeeded and trial < max_trial:
+                    f = saver.get_open_file()
+                    if f is None:
+                        time.sleep(wait_interval_between_trial)
+                        trial += 1
+                        continue
                     if ds_name not in f:
                         f.create_dataset(
                             ds_name,
@@ -866,6 +884,9 @@ class NI_DAQmxCounterWorker(Worker):
                         old_len = ds.shape[0]
                         ds.resize((old_len + samples_read,))
                         ds[old_len:] = data
+                    data_save_succeeded = True
+                if not data_save_succeeded:
+                    raise RuntimeError("[NI_DAQmxCounter] failed to save data after {max_trial} attempts. Data was lost.")
 
             if samples_read > 0 and self.online_monitor:
                 dummy_interval = interval * 1e9 / samples_read # in nanoseconds
@@ -873,17 +894,21 @@ class NI_DAQmxCounterWorker(Worker):
                 now_ns = time.time_ns()
 
                 for i_sample in range(samples_read):
-                    self.online_monitor.send_point(
-                        measurement="count",
-                        tags={
-                            "shot_file": Path(self.h5_file).stem,
-                            "device_name": self.device_name,
-                        },
-                        fields={
-                            self.instructions[i_task]["label"]: self.data_buffer[i_task][i_sample],
-                        },
-                        timestamp_ns=now_ns - dummy_interval * (samples_read - i_sample - 1)
-                    )
+                    try:
+                        self.online_monitor.send_point(
+                            measurement="count",
+                            tags={
+                                "shot_file": Path(self.h5_file).stem,
+                                "device_name": self.device_name,
+                            },
+                            fields={
+                                self.instructions[i_task]["label"]: self.data_buffer[i_task][i_sample],
+                            },
+                            timestamp_ns=now_ns - dummy_interval * (samples_read - i_sample - 1)
+                        )
+                    except Exception as exc:
+                        self.logger.warning("Online monitor send failed: %s", exc)
+                        break
 
             time.sleep(interval)
 
@@ -946,14 +971,20 @@ class NI_DAQmxCounterWorker(Worker):
 
     def _stop_task(self):
         with self.tasklock:
+            self.logger.debug('[CounterWorker] Stopping tasks')
+
             if len(self.tasks) == 0:
                 raise RuntimeError('Task not running')
 
             self.event_task_stopped.set()
+            self.logger.debug('[CounterWorker] Event of task stopped is set')
 
             for i_task, task in enumerate(self.tasks):
                 task.StopTask()
+                self.logger.debug(f'[CounterWorker] Task {i_task} stopped')
+
                 self.thread_polling_data[i_task].join()
+                self.logger.debug(f'[CounterWorker] Thread polling data {i_task} joined')
 
                 data_buffer = self.data_buffer[i_task]
                 query_sample_size = data_buffer.shape[0]
@@ -965,6 +996,8 @@ class NI_DAQmxCounterWorker(Worker):
                         query_sample_size -= 1
                     else:
                         break
+
+                self.logger.debug(f'[CounterWorker] Finished reading data from task {i_task}')
 
                 task.ClearTask()
 
