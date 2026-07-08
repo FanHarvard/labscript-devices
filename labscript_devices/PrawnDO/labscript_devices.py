@@ -138,10 +138,11 @@ class PrawnDO(PseudoclockDevice):
                 'trigger_delay',
                 'trigger_minimum_duration',
                 'wait_delay',
+                'hold_unused_outputs',
             ]
         }
     )
-    def __init__(self, name, 
+    def __init__(self, name,
                  trigger_device = None,
                  trigger_connection = None,
                  clock_line = None,
@@ -149,6 +150,7 @@ class PrawnDO(PseudoclockDevice):
                  pico_board = 'pico1',
                  clock_frequency = 100e6,
                  external_clock = False,
+                 hold_unused_outputs = False,
                 ):
         """PrawnDO digital output device.
         
@@ -180,6 +182,10 @@ class PrawnDO(PseudoclockDevice):
                 Must be less than 133 MHz for pico1, 150 MHz for pico2. Default is `100e6`.
             external_clock (bool, optional): Whether to use an external clock.
                 Default is `False`.
+            hold_unused_outputs (bool, optional): If `True`, digital outputs not
+                explicitly commanded in a shot retain their pre-shot manual
+                value during and after buffered execution instead of being
+                driven to 0. Default is `False` (upstream behaviour).
         """
         if pico_board in self.allowed_boards:
             self.pico_board = pico_board
@@ -256,6 +262,16 @@ class PrawnDO(PseudoclockDevice):
 
 
     def generate_code(self, hdf5_file):
+        # Record which channels the shot explicitly commands *before* the base
+        # generate_code injects default (hold-at-default) instructions for any
+        # untouched outputs via do_checks(). Stored as 'commanded_mask' so the
+        # BLACS worker can optionally hold uncommanded lines at their manual
+        # value instead of driving them to 0.
+        commanded_mask = 0
+        for output in self.get_all_outputs():
+            if output.instructions:
+                commanded_mask |= 1 << int(output.connection.split('do')[-1])
+
         PseudoclockDevice.generate_code(self, hdf5_file)
 
         bits = [0] * 16 # Start with a list of 16 zeros
@@ -312,6 +328,9 @@ class PrawnDO(PseudoclockDevice):
         pulse_program['bit_sets'] = bit_sets
         pulse_program['reps'] = reps
         group.create_dataset('pulse_program', data=pulse_program)
+        # Channels explicitly commanded this shot (see above); used by the BLACS
+        # worker's optional hold-unused-outputs behaviour.
+        group.attrs['commanded_mask'] = np.uint16(commanded_mask)
 
 
 class _PrawnDOIntermediateDevice(IntermediateDevice):
