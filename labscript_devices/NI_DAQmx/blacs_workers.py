@@ -45,6 +45,33 @@ from pythonlib.data_saver import DataSaver
 from pythonlib.online_monitor import OnlineMonitor
 
 
+def _parse_online_monitor_tags(tags_string):
+    tags_string = (tags_string or '').strip()
+    if not tags_string:
+        return {}
+    if tags_string.startswith('{'):
+        tags = json.loads(tags_string)
+        if not isinstance(tags, dict):
+            raise ValueError("OnlineMonitor tags JSON must be an object")
+        return {str(key): str(value) for key, value in tags.items()}
+
+    tags = {}
+    for item in tags_string.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            raise ValueError(
+                "OnlineMonitor tags must be comma-separated key=value pairs"
+            )
+        key, value = item.split('=', 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("OnlineMonitor tag keys cannot be empty")
+        tags[key] = value.strip()
+    return tags
+
+
 class NI_DAQmxOutputWorker(Worker):
     def _reserved_lines_by_port(self):
         lines_by_port = {}
@@ -770,6 +797,7 @@ class NI_DAQmxCounterWorker(Worker):
         self.daq_status = []
         self.data_saver = []
         self.online_monitor = None
+        self.manual_online_monitor = None
 
         self.tasks = []
         self.thread_polling_data = []
@@ -780,6 +808,9 @@ class NI_DAQmxCounterWorker(Worker):
     def shutdown(self):
         for counter_name in list(self.manual_counters):
             self.stop_manual_counter(counter_name)
+        if self.manual_online_monitor is not None:
+            self.manual_online_monitor.close()
+            self.manual_online_monitor = None
         self.manual_udp_socket.close()
         if len(self.tasks) > 0:
             self._stop_task()
@@ -885,6 +916,20 @@ class NI_DAQmxCounterWorker(Worker):
     def noop(self):
         return {}
 
+    def _ensure_manual_online_monitor(self):
+        if self.manual_online_monitor is None:
+            self.manual_online_monitor = OnlineMonitor()
+        return self.manual_online_monitor
+
+    def _close_manual_online_monitor_if_idle(self):
+        if self.manual_online_monitor is None:
+            return
+        for state in self.manual_counters.values():
+            if state.get('online_monitor_enabled'):
+                return
+        self.manual_online_monitor.close()
+        self.manual_online_monitor = None
+
     def _counter_internal_output_terminal(self, counter_connection):
         if '/' in counter_connection:
             return '/' + counter_connection.lstrip('/') + 'InternalOutput'
@@ -953,6 +998,18 @@ class NI_DAQmxCounterWorker(Worker):
             average_count = int(config['average_count'])
             udp_host = config.get('udp_host', '')
             udp_port = int(config.get('udp_port', 0))
+            online_monitor_enabled = bool(
+                config.get('online_monitor_enabled', False)
+            )
+            try:
+                online_monitor_tags = _parse_online_monitor_tags(
+                    config.get('online_monitor_tags', '')
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Manual counter '%s' has invalid OnlineMonitor tags: %s"
+                    % (counter_name, exc)
+                )
 
             if sample_clock == 'connection_table':
                 sample = counter['sample']
@@ -1007,11 +1064,15 @@ class NI_DAQmxCounterWorker(Worker):
                 'values': deque(maxlen=average_count),
                 'udp_host': udp_host,
                 'udp_port': udp_port,
+                'online_monitor_enabled': online_monitor_enabled,
+                'online_monitor_tags': online_monitor_tags,
                 'fetch_interval': fetch_interval,
             }
             self.manual_counters[counter_name] = state
 
             try:
+                if online_monitor_enabled:
+                    self._ensure_manual_online_monitor()
                 ci_task.StartTask()
                 if co_task is not None:
                     co_task.StartTask()
@@ -1040,6 +1101,7 @@ class NI_DAQmxCounterWorker(Worker):
                         exc_info=True,
                     )
                 task.ClearTask()
+            self._close_manual_online_monitor_if_idle()
             return {'status': 'stopped'}
 
     def fetch_manual_counter(self, counter_name):
@@ -1061,6 +1123,7 @@ class NI_DAQmxCounterWorker(Worker):
         values, state['last_count'] = self._manual_counter_values(
             counts, state['last_count'], state['scale']
         )
+        now_ns = time.time_ns()
         for value in values:
             state['values'].append(float(value))
             if state['udp_host'] and state['udp_port']:
@@ -1076,6 +1139,31 @@ class NI_DAQmxCounterWorker(Worker):
                         counter_name,
                         exc,
                     )
+            if state.get('online_monitor_enabled') and self.manual_online_monitor:
+                tags = dict(state.get('online_monitor_tags', {}))
+                tags.update(
+                    {
+                        "device_name": self.device_name,
+                        "counter_name": counter_name,
+                        "connection": state['counter']['connection'],
+                        "mode": "manual",
+                    }
+                )
+                try:
+                    self.manual_online_monitor.send_point(
+                        measurement="count",
+                        tags=tags,
+                        fields={counter_name: float(value)},
+                        timestamp_ns=now_ns,
+                    )
+                except Exception as exc:
+                    state['daq_status']['online_monitor_error'] = str(exc)
+                    self.logger.warning(
+                        "Manual counter OnlineMonitor send failed for %s: %s",
+                        counter_name,
+                        exc,
+                    )
+                    break
 
         if len(values) == 0:
             return {'status': 'running', 'samples_read': samples_read}
@@ -1087,6 +1175,11 @@ class NI_DAQmxCounterWorker(Worker):
             status = 'running (overflow)'
         if state['daq_status'].get('udp_error'):
             status = 'running (UDP error: %s)' % state['daq_status']['udp_error']
+        if state['daq_status'].get('online_monitor_error'):
+            status = (
+                'running (OnlineMonitor error: %s)'
+                % state['daq_status']['online_monitor_error']
+            )
         return {
             'status': status,
             'samples_read': samples_read,

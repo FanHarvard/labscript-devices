@@ -50,6 +50,55 @@ def _ensure_str(value):
     return str(value)
 
 
+def configure_manual_counter_online_monitor(counter, enabled=True, tags=''):
+    """Configure OnlineMonitor forwarding for a manual-mode NI-DAQmx counter.
+
+    Use this in the connection table after creating a labscript ``Counter``.
+    ``tags`` must be a string, either comma-separated ``key=value`` pairs or a
+    JSON object string. For example::
+
+        configure_manual_counter_online_monitor(
+            counts,
+            enabled=True,
+            tags='source=mot_fluorescence,unit=counts_per_second',
+        )
+
+    The setting is stored in the counter's connection-table properties and is
+    used by BLACS manual counter mode when the counter is started.
+    """
+    if not isinstance(tags, str):
+        raise TypeError("Manual counter OnlineMonitor tags must be a string")
+
+    manual_config = {}
+    if hasattr(counter, 'get_property'):
+        manual_config.update(
+            counter.get_property(
+                'manual_acquisition',
+                'connection_table_properties',
+                default={},
+            )
+        )
+    else:
+        manual_config.update(getattr(counter, 'manual_acquisition_defaults', {}))
+
+    manual_config.update(
+        {
+            'online_monitor_enabled': bool(enabled),
+            'online_monitor_tags': tags,
+        }
+    )
+
+    if hasattr(counter, 'set_property'):
+        counter.set_property(
+            'manual_acquisition',
+            manual_config,
+            location='connection_table_properties',
+            overwrite=True,
+        )
+    else:
+        counter.manual_acquisition_defaults = manual_config
+
+
 class NI_DAQmx(IntermediateDevice):
     # Will be overridden during __init__ depending on configuration:
     allowed_children = []
@@ -745,6 +794,12 @@ class NI_DAQmx(IntermediateDevice):
                 'average_count': average_count,
                 'udp_host': str(manual_config.get('udp_host', '127.0.0.1')),
                 'udp_port': udp_port,
+                'online_monitor_enabled': bool(
+                    manual_config.get('online_monitor_enabled', False)
+                ),
+                'online_monitor_tags': str(
+                    manual_config.get('online_monitor_tags', '')
+                ),
             }
 
         counter_dtypes = [
@@ -762,6 +817,8 @@ class NI_DAQmx(IntermediateDevice):
             ('manual average count', 'u4'),
             ('manual udp host', 'S256'),
             ('manual udp port', 'u4'),
+            ('manual online monitor enabled', '?'),
+            ('manual online monitor tags', 'S1024'),
         ]
         counter_table = np.empty(len(counters), dtype=counter_dtypes)
         for i, (connection, counter) in enumerate(sorted(counters.items())):
@@ -781,6 +838,8 @@ class NI_DAQmx(IntermediateDevice):
                 manual_config.get('average_count', 10),
                 manual_config.get('udp_host', '127.0.0.1'),
                 manual_config.get('udp_port', 9000),
+                manual_config.get('online_monitor_enabled', False),
+                manual_config.get('online_monitor_tags', ''),
             )
         return counter_table
 

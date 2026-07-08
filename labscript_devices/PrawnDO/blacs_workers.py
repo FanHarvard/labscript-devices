@@ -291,21 +291,18 @@ class PrawnDOWorker(Worker):
             # get more convenient handle to smart cache array
             curr_program = self.smart_cache['pulse_program']
 
-            # if arrays aren't of same shape, only compare up to smaller array size
+            # If arrays aren't of the same shape, fully refresh. The incremental
+            # path cannot safely grow/shrink the cached numpy array in-place, and
+            # shortening would leave stale instructions on the device.
             n_curr = len(curr_program)
             n_new = len(pulse_program)
-            if n_curr > n_new:
-                # technically don't need to reprogram current elements beyond end of new elements
-                new_inst = np.sum(curr_program[:n_new] != pulse_program)
-            elif n_curr < n_new:
-                n_diff = n_new - n_curr
-                val_diffs = np.sum(curr_program != pulse_program[:n_curr])
-                new_inst = val_diffs + n_diff
+            if n_curr != n_new:
+                fresh = True
             else:
                 new_inst = np.sum(curr_program != pulse_program)
 
-            if new_inst / n_new > 0.1:
-                fresh = True
+                if new_inst / n_new > 0.1:
+                    fresh = True
 
         # if fresh or not smart cache, program full table as a batch
         # this is faster than going line by line

@@ -32,6 +32,8 @@ DEFAULT_MANUAL_COUNTER_CONFIG = {
     'average_count': 10,
     'udp_host': '127.0.0.1',
     'udp_port': 9000,
+    'online_monitor_enabled': False,
+    'online_monitor_tags': '',
 }
 
 
@@ -97,6 +99,20 @@ def _read_counter_declarations(group):
                 ),
                 'udp_port': int(
                     _row_get(row, 'manual udp port', manual_config['udp_port'])
+                ),
+                'online_monitor_enabled': bool(
+                    _row_get(
+                        row,
+                        'manual online monitor enabled',
+                        manual_config['online_monitor_enabled'],
+                    )
+                ),
+                'online_monitor_tags': _ensure_str(
+                    _row_get(
+                        row,
+                        'manual online monitor tags',
+                        manual_config['online_monitor_tags'],
+                    )
                 ),
             }
         )
@@ -401,6 +417,10 @@ class NI_DAQmxTab(DeviceTab):
                 ("Multiplication factor", "%.6g" % config['multiplication_factor']),
                 ("Averaging points", "%d" % config['average_count']),
                 ("qtconsole", "%s:%d" % (config['udp_host'], config['udp_port'])),
+                (
+                    "OnlineMonitor",
+                    "enabled" if config['online_monitor_enabled'] else "disabled",
+                ),
             ]:
                 grid.addWidget(QtWidgets.QLabel(label), row, 0)
                 grid.addWidget(QtWidgets.QLabel(text), row, 1)

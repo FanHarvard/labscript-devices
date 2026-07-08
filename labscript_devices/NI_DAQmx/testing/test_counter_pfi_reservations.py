@@ -9,7 +9,10 @@ os.environ.setdefault('READTHEDOCS', 'True')
 import numpy as np
 
 from labscript import LabscriptError
-from labscript_devices.NI_DAQmx.labscript_devices import NI_DAQmx
+from labscript_devices.NI_DAQmx.labscript_devices import (
+    NI_DAQmx,
+    configure_manual_counter_online_monitor,
+)
 
 
 class CounterStub:
@@ -72,6 +75,23 @@ class TestCounterPFIReservations(unittest.TestCase):
         self.assertEqual(table['manual rate'][0], 10.0)
         self.assertEqual(table['manual buffer size'][0], 1024)
         self.assertEqual(table['manual polling interval'][0], 0.1)
+        self.assertFalse(table['manual online monitor enabled'][0])
+        self.assertEqual(table['manual online monitor tags'][0], b'')
+
+    def test_manual_counter_online_monitor_config_goes_in_table(self):
+        device = self.make_device()
+        counter = CounterStub(name='counts', edge='PFI0', sample='PFI1')
+        configure_manual_counter_online_monitor(
+            counter,
+            enabled=True,
+            tags='source=test_counter,unit=counts_per_second',
+        )
+        table = device._make_counter_declaration_table({'ctr0': counter})
+        self.assertTrue(table['manual online monitor enabled'][0])
+        self.assertEqual(
+            table['manual online monitor tags'][0],
+            b'source=test_counter,unit=counts_per_second',
+        )
 
     def test_buffered_counter_acquisitions_cannot_duplicate_ctr(self):
         device = self.make_device()
@@ -116,6 +136,13 @@ def import_counter_worker():
     return NI_DAQmxCounterWorker
 
 
+def import_counter_worker_module():
+    import_counter_worker()
+    import labscript_devices.NI_DAQmx.blacs_workers as blacs_workers
+
+    return blacs_workers
+
+
 def import_counter_tab():
     blacs = types.ModuleType('blacs')
     device_base_class = types.ModuleType('blacs.device_base_class')
@@ -148,6 +175,24 @@ def import_counter_tab():
 
 
 class TestManualCounterProcessing(unittest.TestCase):
+    def test_online_monitor_tags_parse_key_value_string(self):
+        worker_module = import_counter_worker_module()
+        self.assertEqual(
+            worker_module._parse_online_monitor_tags(
+                'source=test_counter, unit=counts_per_second'
+            ),
+            {'source': 'test_counter', 'unit': 'counts_per_second'},
+        )
+
+    def test_online_monitor_tags_parse_json_string(self):
+        worker_module = import_counter_worker_module()
+        self.assertEqual(
+            worker_module._parse_online_monitor_tags(
+                '{"source": "test_counter", "unit": "counts_per_second"}'
+            ),
+            {'source': 'test_counter', 'unit': 'counts_per_second'},
+        )
+
     def test_manual_counter_values_wait_for_two_counts_without_previous(self):
         worker_class = import_counter_worker()
         worker = object.__new__(worker_class)
