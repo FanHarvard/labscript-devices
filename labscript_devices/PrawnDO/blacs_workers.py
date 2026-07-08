@@ -288,6 +288,13 @@ class PrawnDOWorker(Worker):
         if fresh:
             self.smart_cache = {'pulse_program':None}
 
+        # Persist the manual output state present immediately before the shot so
+        # the shot record is self-contained (e.g. which switches were held on).
+        # Done for every shot, including ones that do not drive the PrawnDO.
+        self._save_output_state(
+            h5file, device_name, 'output_state_before_shot', initial_values
+        )
+
         with h5py.File(h5file, 'r') as hdf5_file:
             group = hdf5_file['devices'][device_name]
             if 'pulse_program' not in group:
@@ -311,12 +318,6 @@ class PrawnDOWorker(Worker):
             pulse_program['bit_sets'] = (
                 (bit_sets & commanded_mask) | manual_held
             ).astype(np.uint16)
-
-        # Persist the manual output state present immediately before the shot so
-        # the shot record is self-contained (e.g. which switches were held on).
-        self._save_output_state(
-            h5file, device_name, 'output_state_before_shot', initial_values
-        )
 
         # configure clock from device properties
         ext = self.device_properties['external_clock']
