@@ -865,6 +865,8 @@ class NI_DAQmxCounterWorker(Worker):
                         "shot_file": Path(self.h5_file).stem,
                     },
                     logger=self.logger,
+                    # The worker owns the measurement name.
+                    measurement="count",
                 )
             )
         
@@ -1038,6 +1040,8 @@ class NI_DAQmxCounterWorker(Worker):
                     'mode': 'manual',
                 },
                 logger=self.logger,
+                # The worker owns the measurement name.
+                measurement='count',
             )
 
             state = {
