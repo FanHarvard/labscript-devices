@@ -30,6 +30,7 @@ from labscript import (
 )
 from labscript_utils import dedent
 from .utils import split_conn_DO, split_conn_AO, split_conn_AI, split_conn_CI
+import json
 import numpy as np
 import warnings
 
@@ -48,55 +49,6 @@ def _ensure_str(value):
     if hasattr(value, "decode"):
         return value.decode()
     return str(value)
-
-
-def configure_manual_counter_online_monitor(counter, enabled=True, tags=''):
-    """Configure OnlineMonitor forwarding for a manual-mode NI-DAQmx counter.
-
-    Use this in the connection table after creating a labscript ``Counter``.
-    ``tags`` must be a string, either comma-separated ``key=value`` pairs or a
-    JSON object string. For example::
-
-        configure_manual_counter_online_monitor(
-            counts,
-            enabled=True,
-            tags='source=mot_fluorescence,unit=counts_per_second',
-        )
-
-    The setting is stored in the counter's connection-table properties and is
-    used by BLACS manual counter mode when the counter is started.
-    """
-    if not isinstance(tags, str):
-        raise TypeError("Manual counter OnlineMonitor tags must be a string")
-
-    manual_config = {}
-    if hasattr(counter, 'get_property'):
-        manual_config.update(
-            counter.get_property(
-                'manual_acquisition',
-                'connection_table_properties',
-                default={},
-            )
-        )
-    else:
-        manual_config.update(getattr(counter, 'manual_acquisition_defaults', {}))
-
-    manual_config.update(
-        {
-            'online_monitor_enabled': bool(enabled),
-            'online_monitor_tags': tags,
-        }
-    )
-
-    if hasattr(counter, 'set_property'):
-        counter.set_property(
-            'manual_acquisition',
-            manual_config,
-            location='connection_table_properties',
-            overwrite=True,
-        )
-    else:
-        counter.manual_acquisition_defaults = manual_config
 
 
 class NI_DAQmx(IntermediateDevice):
@@ -743,12 +695,7 @@ class NI_DAQmx(IntermediateDevice):
                 polling_interval = float(
                     manual_config.get('polling_interval', 0.1)
                 )
-                multiplication_factor = float(
-                    manual_config.get('multiplication_factor', 1.0)
-                )
                 buffer_size = int(manual_config.get('buffer_size', 1024))
-                average_count = int(manual_config.get('average_count', 10))
-                udp_port = int(manual_config.get('udp_port', 9000))
             except (TypeError, ValueError):
                 raise LabscriptError(
                     "Manual counter acquisition for %s has non-numeric settings"
@@ -764,25 +711,10 @@ class NI_DAQmx(IntermediateDevice):
                     "Manual counter acquisition for %s requires polling_interval "
                     ">= 0.02 s" % connection
                 )
-            if not np.isfinite(multiplication_factor):
-                raise LabscriptError(
-                    "Manual counter acquisition for %s requires a finite "
-                    "multiplication_factor" % connection
-                )
             if buffer_size < 1:
                 raise LabscriptError(
                     "Manual counter acquisition for %s requires buffer_size >= 1"
                     % connection
-                )
-            if average_count < 1:
-                raise LabscriptError(
-                    "Manual counter acquisition for %s requires average_count >= 1"
-                    % connection
-                )
-            if not 1 <= udp_port <= 65535:
-                raise LabscriptError(
-                    "Manual counter acquisition for %s requires udp_port in "
-                    "1..65535" % connection
                 )
             return {
                 'enabled': bool(manual_config.get('enabled', True)),
@@ -790,17 +722,13 @@ class NI_DAQmx(IntermediateDevice):
                 'rate': rate,
                 'buffer_size': buffer_size,
                 'polling_interval': polling_interval,
-                'multiplication_factor': multiplication_factor,
-                'average_count': average_count,
-                'udp_host': str(manual_config.get('udp_host', '127.0.0.1')),
-                'udp_port': udp_port,
-                'online_monitor_enabled': bool(
-                    manual_config.get('online_monitor_enabled', False)
-                ),
-                'online_monitor_tags': str(
-                    manual_config.get('online_monitor_tags', '')
-                ),
             }
+
+        def monitors_json(counter):
+            monitor = getattr(counter, 'monitor', None)
+            if monitor is None:
+                return '{}'
+            return json.dumps(monitor.to_dict())
 
         counter_dtypes = [
             ('name', 'S256'),
@@ -813,12 +741,9 @@ class NI_DAQmx(IntermediateDevice):
             ('manual rate', 'f8'),
             ('manual buffer size', 'u4'),
             ('manual polling interval', 'f8'),
-            ('manual multiplication factor', 'f8'),
-            ('manual average count', 'u4'),
-            ('manual udp host', 'S256'),
-            ('manual udp port', 'u4'),
-            ('manual online monitor enabled', '?'),
-            ('manual online monitor tags', 'S1024'),
+            # ChannelMonitor spec of the Counter's monitor= argument (JSON),
+            # used in both manual and buffered modes.
+            ('monitors json', 'S1024'),
         ]
         counter_table = np.empty(len(counters), dtype=counter_dtypes)
         for i, (connection, counter) in enumerate(sorted(counters.items())):
@@ -834,12 +759,7 @@ class NI_DAQmx(IntermediateDevice):
                 manual_config.get('rate', 10.0),
                 manual_config.get('buffer_size', 1024),
                 manual_config.get('polling_interval', 0.1),
-                manual_config.get('multiplication_factor', 1.0),
-                manual_config.get('average_count', 10),
-                manual_config.get('udp_host', '127.0.0.1'),
-                manual_config.get('udp_port', 9000),
-                manual_config.get('online_monitor_enabled', False),
-                manual_config.get('online_monitor_tags', ''),
+                monitors_json(counter),
             )
         return counter_table
 

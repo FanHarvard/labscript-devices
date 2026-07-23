@@ -10,6 +10,8 @@
 # file in the root of the project for the full license.             #
 #                                                                   #
 #####################################################################
+import json
+
 import labscript_utils.h5_lock
 import h5py
 from labscript_utils import dedent
@@ -28,12 +30,6 @@ DEFAULT_MANUAL_COUNTER_CONFIG = {
     'rate': 10.0,
     'buffer_size': 1024,
     'polling_interval': 0.1,
-    'multiplication_factor': 1.0,
-    'average_count': 10,
-    'udp_host': '127.0.0.1',
-    'udp_port': 9000,
-    'online_monitor_enabled': False,
-    'online_monitor_tags': '',
 }
 
 
@@ -80,42 +76,14 @@ def _read_counter_declarations(group):
                         manual_config['polling_interval'],
                     )
                 ),
-                'multiplication_factor': float(
-                    _row_get(
-                        row,
-                        'manual multiplication factor',
-                        manual_config['multiplication_factor'],
-                    )
-                ),
-                'average_count': int(
-                    _row_get(
-                        row,
-                        'manual average count',
-                        manual_config['average_count'],
-                    )
-                ),
-                'udp_host': _ensure_str(
-                    _row_get(row, 'manual udp host', manual_config['udp_host'])
-                ),
-                'udp_port': int(
-                    _row_get(row, 'manual udp port', manual_config['udp_port'])
-                ),
-                'online_monitor_enabled': bool(
-                    _row_get(
-                        row,
-                        'manual online monitor enabled',
-                        manual_config['online_monitor_enabled'],
-                    )
-                ),
-                'online_monitor_tags': _ensure_str(
-                    _row_get(
-                        row,
-                        'manual online monitor tags',
-                        manual_config['online_monitor_tags'],
-                    )
-                ),
             }
         )
+        try:
+            monitors = json.loads(
+                _ensure_str(_row_get(row, 'monitors json', '{}')) or '{}'
+            )
+        except ValueError:
+            monitors = {}
         counters.append(
             {
                 'name': _ensure_str(row['name']),
@@ -124,6 +92,8 @@ def _read_counter_declarations(group):
                 'gate': _ensure_str(row['gate terminal']),
                 'sample': _ensure_str(row['sample terminal']),
                 'manual': manual_config,
+                # Per-channel FastMonitor/MetricsMonitor spec (manual+buffered):
+                'monitors': monitors,
             }
         )
     return counters
@@ -385,9 +355,7 @@ class NI_DAQmxTab(DeviceTab):
             stop_button = QtWidgets.QPushButton("Stop")
             stop_button.setEnabled(False)
 
-            formula = QtWidgets.QLabel()
             latest = QtWidgets.QLabel("latest: --")
-            moving_average = QtWidgets.QLabel("moving average: --")
             status = QtWidgets.QLabel("idle")
 
             widgets = {
@@ -395,9 +363,7 @@ class NI_DAQmxTab(DeviceTab):
                 'config': config,
                 'start': start_button,
                 'stop': stop_button,
-                'formula': formula,
                 'latest': latest,
-                'moving_average': moving_average,
                 'status': status,
             }
             self.manual_counter_widgets[counter['name']] = widgets
@@ -409,18 +375,22 @@ class NI_DAQmxTab(DeviceTab):
                 if sample_clock == 'connection_table'
                 else "%s output" % sample_clock
             )
+            monitors = counter.get('monitors') or {}
+            fast_spec = monitors.get('fast')
+            fast_text = (
+                "%s:%d" % (fast_spec['host'], fast_spec['port'])
+                if fast_spec else "disabled"
+            )
+            metrics_text = (
+                "enabled" if monitors.get('metrics') is not None else "disabled"
+            )
             for label, text in [
                 ("Sample clock", sample_clock_text),
                 ("Output counter rate", "%.6g Hz" % config['rate']),
                 ("Buffer length", "%d" % config['buffer_size']),
                 ("Fetch interval", "%.6g ms" % (1000 * config['polling_interval'])),
-                ("Multiplication factor", "%.6g" % config['multiplication_factor']),
-                ("Averaging points", "%d" % config['average_count']),
-                ("qtconsole", "%s:%d" % (config['udp_host'], config['udp_port'])),
-                (
-                    "OnlineMonitor",
-                    "enabled" if config['online_monitor_enabled'] else "disabled",
-                ),
+                ("FastMonitor", fast_text),
+                ("MetricsMonitor", metrics_text),
             ]:
                 grid.addWidget(QtWidgets.QLabel(label), row, 0)
                 grid.addWidget(QtWidgets.QLabel(text), row, 1)
@@ -428,11 +398,7 @@ class NI_DAQmxTab(DeviceTab):
             grid.addWidget(start_button, row, 0)
             grid.addWidget(stop_button, row, 1)
             row += 1
-            grid.addWidget(formula, row, 0, 1, 2)
-            row += 1
             grid.addWidget(latest, row, 0, 1, 2)
-            row += 1
-            grid.addWidget(moving_average, row, 0, 1, 2)
             row += 1
             grid.addWidget(status, row, 0, 1, 2)
 
@@ -442,7 +408,6 @@ class NI_DAQmxTab(DeviceTab):
             stop_button.clicked.connect(
                 lambda _=None, name=counter['name']: self.stop_manual_counter(name)
             )
-            self._update_counter_formula(counter['name'])
             outer_layout.addWidget(panel)
 
         self.get_tab_layout().addWidget(group)
@@ -455,21 +420,6 @@ class NI_DAQmxTab(DeviceTab):
         widgets = self.manual_counter_widgets[counter_name]
         widgets['start'].setEnabled(not running)
         widgets['stop'].setEnabled(running)
-
-    def _update_counter_formula(self, counter_name):
-        widgets = self.manual_counter_widgets[counter_name]
-        config = widgets['config']
-        sample_clock = config['sample_clock']
-        factor = config['multiplication_factor']
-        if sample_clock == 'connection_table':
-            text = "latest = diff * %.6g" % factor
-        else:
-            rate = config['rate']
-            text = (
-                "latest = diff / (1 / %.6g Hz) * %.6g = diff * %.6g * %.6g"
-                % (rate, factor, rate, factor)
-            )
-        widgets['formula'].setText(text)
 
     def _ensure_manual_counter_monitor(self):
         if len(self.manual_counter_active) == 1:
@@ -530,8 +480,5 @@ class NI_DAQmxTab(DeviceTab):
             if result.get('values'):
                 widgets['latest'].setText(
                     "latest: %.6g" % result['latest_value']
-                )
-                widgets['moving_average'].setText(
-                    "moving average: %.6g" % result['moving_average']
                 )
             widgets['status'].setText(result.get('status', 'running'))
