@@ -42,7 +42,7 @@ from pathlib import Path
 import PyDAQmx
 
 from pythonlib.data_saver import DataSaver
-from user_devices.fanlab_devices.utils.fast_monitor import MonitorStreams
+from pythonlib.online_monitor import MonitorStreams
 
 
 class NI_DAQmxOutputWorker(Worker):
