@@ -60,7 +60,9 @@ class PrawnBlasterWorker(Worker):
         self.min_version = (1, 1, 0)
         
         self.conn = serial.Serial(self.com_port, 115200, timeout=1)
-        self.check_status()
+        # A tab or BLACS restart during a shot leaves the PrawnBlaster running the
+        # shot's program, and it refuses the configuration below until that ends
+        self._abort_if_buffered()
 
         # configure number of pseudoclocks
         self.send_command_ok(f"setnumpseudoclocks {self.num_pseudoclocks}")
@@ -544,16 +546,34 @@ class PrawnBlasterWorker(Worker):
         Returns:
             bool: `True` is abort is successful.
         """
-        if not self.is_master_pseudoclock:
-            # Only need to send abort signal if we have told the PrawnBlaster to wait
-            # for a hardware trigger. Otherwise it's just been programmed with
-            # instructions and there is nothing we need to do to abort.
-            self.conn.write(b"abort\r\n")
-            assert self.conn.readline().decode() == "ok\r\n"
-            # loop until abort complete
-            while self.read_status()[0] != 5:
-                time.sleep(0.5)
+        # A master PrawnBlaster runs on after `start` until its program ends, and a
+        # secondary one waits for its hardware trigger, so both must be told to abort.
+        # One that has only been programmed is not in buffered execution and is left
+        # alone.
+        self._abort_if_buffered()
         return True
+
+    def _abort_if_buffered(self):
+        """Aborts buffered execution if the PrawnBlaster is in it, then waits until
+        it is in run-status 0 or 5, the only states that accept manual-mode commands.
+        """
+        run_status, _ = self.read_status()
+        if run_status in (1, 2):
+            self.logger.info(f"sending abort (run-status {run_status})")
+            resp = self.send_command("abort")
+            run_status, _ = self.read_status()
+            # The program may have ended between the status check and the abort
+            if resp != "ok\r\n" and run_status not in (0, 5, 6):
+                raise LabscriptError(f"Command 'abort' failed. Got response '{repr(resp)}'")
+        deadline = time.time() + 10
+        while run_status not in (0, 5):
+            if time.time() > deadline:
+                raise LabscriptError(
+                    f"PrawnBlaster still in run-status {run_status} 10 s after abort. "
+                    "Unplug and replug its USB, then restart the tab."
+                )
+            time.sleep(0.1)
+            run_status, _ = self.read_status()
 
     def abort_transition_to_buffered(self):
         """Aborts a transition to buffered.
