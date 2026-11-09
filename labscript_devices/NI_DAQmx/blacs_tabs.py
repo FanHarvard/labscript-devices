@@ -12,11 +12,12 @@
 #####################################################################
 import labscript_utils.h5_lock
 import h5py
+import json
 from labscript_utils import dedent
 
 from blacs.device_base_class import DeviceTab
 from blacs.tab_base_classes import define_state, MODE_MANUAL
-from qtutils.qt import QtWidgets
+from qtutils.qt import QtCore, QtWidgets
 from .utils import split_conn_AO, split_conn_DO
 from . import models
 import warnings
@@ -28,13 +29,35 @@ DEFAULT_MANUAL_COUNTER_CONFIG = {
     'rate': 10.0,
     'buffer_size': 1024,
     'polling_interval': 0.1,
-    'multiplication_factor': 1.0,
-    'average_count': 10,
-    'udp_host': '127.0.0.1',
-    'udp_port': 9000,
-    'online_monitor_enabled': False,
-    'online_monitor_tags': '',
 }
+
+
+def _style_counter_button(button):
+    """Keep controls readable under BLACS's transparent dock/scroll styling."""
+    button.setStyleSheet("""
+        QPushButton, QToolButton {
+            background-color: palette(button);
+            color: palette(button-text);
+            border: 1px solid palette(mid);
+            border-radius: 3px;
+            padding: 4px 10px;
+        }
+        QPushButton:hover, QToolButton:hover {
+            background-color: palette(midlight);
+        }
+        QPushButton:pressed, QToolButton:pressed, QToolButton:checked {
+            background-color: palette(highlight);
+            color: palette(highlighted-text);
+        }
+        QPushButton:disabled, QToolButton:disabled {
+            background-color: palette(window);
+            color: palette(text);
+            border: 1px dashed palette(mid);
+        }
+        QPushButton:focus, QToolButton:focus {
+            border: 1px solid palette(highlight);
+        }
+    """)
 
 
 def _ensure_str(value):
@@ -56,6 +79,8 @@ def _read_counter_declarations(group):
         return []
     counters = []
     for row in group['COUNTERS'][:]:
+        if 'monitor' not in row.dtype.names:
+            raise RuntimeError('Recompile the connection table with ChannelMonitor support')
         manual_config = dict(DEFAULT_MANUAL_COUNTER_CONFIG)
         manual_config.update(
             {
@@ -80,40 +105,6 @@ def _read_counter_declarations(group):
                         manual_config['polling_interval'],
                     )
                 ),
-                'multiplication_factor': float(
-                    _row_get(
-                        row,
-                        'manual multiplication factor',
-                        manual_config['multiplication_factor'],
-                    )
-                ),
-                'average_count': int(
-                    _row_get(
-                        row,
-                        'manual average count',
-                        manual_config['average_count'],
-                    )
-                ),
-                'udp_host': _ensure_str(
-                    _row_get(row, 'manual udp host', manual_config['udp_host'])
-                ),
-                'udp_port': int(
-                    _row_get(row, 'manual udp port', manual_config['udp_port'])
-                ),
-                'online_monitor_enabled': bool(
-                    _row_get(
-                        row,
-                        'manual online monitor enabled',
-                        manual_config['online_monitor_enabled'],
-                    )
-                ),
-                'online_monitor_tags': _ensure_str(
-                    _row_get(
-                        row,
-                        'manual online monitor tags',
-                        manual_config['online_monitor_tags'],
-                    )
-                ),
             }
         )
         counters.append(
@@ -124,6 +115,7 @@ def _read_counter_declarations(group):
                 'gate': _ensure_str(row['gate terminal']),
                 'sample': _ensure_str(row['sample terminal']),
                 'manual': manual_config,
+                'monitor': json.loads(_ensure_str(_row_get(row, 'monitor', 'null'))),
             }
         )
     return counters
@@ -217,8 +209,8 @@ class NI_DAQmxTab(DeviceTab):
                             properties['PFI_connections'][_ensure_str(pfi)]
                             for pfi in ci_attrs['used_pfies']
                         ]
-        except Exception:
-            pass
+        except (KeyError, OSError):
+            raise
 
         # Create output objects:
         AO_prop = {}
@@ -368,26 +360,50 @@ class NI_DAQmxTab(DeviceTab):
         self.supports_remote_value_check(False)
         self.supports_smart_programming(False)
 
+    def _append_counter_palette(self, name):
+        # Place the manual counter panels in the same ToolPaletteGroup as the
+        # analog and digital output palettes, so they get a matching
+        # collapsible header and flowing grid layout. Imported here rather
+        # than at module level as it requires a Qt library:
+        from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
+
+        layout = self.get_tab_layout()
+        for index in range(layout.count()):
+            widget = layout.itemAt(index).widget()
+            if widget is not None and isinstance(widget.layout(), ToolPaletteGroup):
+                toolpalettegroup = widget.layout()
+                break
+        else:
+            # No output palettes exist (device without AO/DO widgets):
+            widget = QtWidgets.QWidget()
+            toolpalettegroup = ToolPaletteGroup(widget)
+            layout.addWidget(widget)
+        if toolpalettegroup.has_palette(name):
+            return toolpalettegroup.get_palette(name)
+        return toolpalettegroup.append_new_palette(name)
+
     def _create_manual_counter_widgets(self, counter_declarations):
-        group = QtWidgets.QGroupBox("Manual counters")
-        outer_layout = QtWidgets.QVBoxLayout(group)
+        toolpalette = self._append_counter_palette("Counter inputs")
 
         for counter in counter_declarations:
             config = counter['manual']
             if not config.get('enabled', True):
                 continue
-            panel = QtWidgets.QGroupBox(
-                "%s (%s)" % (counter['name'], counter['connection'])
-            )
+            panel = QtWidgets.QWidget()
             grid = QtWidgets.QGridLayout(panel)
+            grid.setContentsMargins(6, 6, 6, 6)
+            title = QtWidgets.QLabel("%s\n%s" % (counter['connection'], counter['name']))
+            title.setAlignment(QtCore.Qt.AlignCenter)
+            grid.addWidget(title, 0, 0, 1, 2)
 
             start_button = QtWidgets.QPushButton("Start")
             stop_button = QtWidgets.QPushButton("Stop")
+            _style_counter_button(start_button)
+            _style_counter_button(stop_button)
             stop_button.setEnabled(False)
 
             formula = QtWidgets.QLabel()
-            latest = QtWidgets.QLabel("latest: --")
-            moving_average = QtWidgets.QLabel("moving average: --")
+            latest = QtWidgets.QLabel("Value: --")
             status = QtWidgets.QLabel("idle")
 
             widgets = {
@@ -397,44 +413,43 @@ class NI_DAQmxTab(DeviceTab):
                 'stop': stop_button,
                 'formula': formula,
                 'latest': latest,
-                'moving_average': moving_average,
                 'status': status,
             }
             self.manual_counter_widgets[counter['name']] = widgets
 
-            row = 0
-            sample_clock = config['sample_clock']
-            sample_clock_text = (
-                "As connection table"
-                if sample_clock == 'connection_table'
-                else "%s output" % sample_clock
-            )
+            grid.addWidget(latest, 1, 0, 1, 2)
+            grid.addWidget(start_button, 2, 0)
+            grid.addWidget(stop_button, 2, 1)
+            grid.addWidget(status, 3, 0, 1, 2)
+            details_button = QtWidgets.QToolButton()
+            details_button.setText("Details")
+            details_button.setCheckable(True)
+            _style_counter_button(details_button)
+            grid.addWidget(details_button, 4, 0, 1, 2)
+            details = QtWidgets.QWidget()
+            form = QtWidgets.QFormLayout(details)
+            form.setContentsMargins(0, 0, 0, 0)
+            monitor = counter.get('monitor') or {}
+            fast = monitor.get('fast')
             for label, text in [
-                ("Sample clock", sample_clock_text),
-                ("Output counter rate", "%.6g Hz" % config['rate']),
-                ("Buffer length", "%d" % config['buffer_size']),
-                ("Fetch interval", "%.6g ms" % (1000 * config['polling_interval'])),
-                ("Multiplication factor", "%.6g" % config['multiplication_factor']),
-                ("Averaging points", "%d" % config['average_count']),
-                ("qtconsole", "%s:%d" % (config['udp_host'], config['udp_port'])),
-                (
-                    "OnlineMonitor",
-                    "enabled" if config['online_monitor_enabled'] else "disabled",
-                ),
+                ("Edge terminal", counter['edge']),
+                ("Gate terminal", counter['gate'] or "None"),
+                ("Sample clock", counter['sample'] if config['sample_clock'] == 'connection_table'
+                 else "%s, %.6g Hz" % (config['sample_clock'], config['rate'])),
+                ("Buffer length", str(config['buffer_size'])),
+                ("Fast logger", "%s:%s" % (fast['host'], fast['port']) if fast else "Off"),
+                ("Metrics", "On" if monitor.get('metrics') is not None else "Off"),
             ]:
-                grid.addWidget(QtWidgets.QLabel(label), row, 0)
-                grid.addWidget(QtWidgets.QLabel(text), row, 1)
-                row += 1
-            grid.addWidget(start_button, row, 0)
-            grid.addWidget(stop_button, row, 1)
-            row += 1
-            grid.addWidget(formula, row, 0, 1, 2)
-            row += 1
-            grid.addWidget(latest, row, 0, 1, 2)
-            row += 1
-            grid.addWidget(moving_average, row, 0, 1, 2)
-            row += 1
-            grid.addWidget(status, row, 0, 1, 2)
+                form.addRow(label, QtWidgets.QLabel(text))
+            form.addRow(formula)
+            grid.addWidget(details, 5, 0, 1, 2)
+            details.hide()
+            def toggle_details(visible, details=details, panel=panel):
+                details.setVisible(visible)
+                panel.layout().activate()
+                # ToolPalette caches row heights until explicitly laid out.
+                toolpalette._layout_widgets(force_relayout=True)
+            details_button.toggled.connect(toggle_details)
 
             start_button.clicked.connect(
                 lambda _=None, name=counter['name']: self.start_manual_counter(name)
@@ -443,9 +458,7 @@ class NI_DAQmxTab(DeviceTab):
                 lambda _=None, name=counter['name']: self.stop_manual_counter(name)
             )
             self._update_counter_formula(counter['name'])
-            outer_layout.addWidget(panel)
-
-        self.get_tab_layout().addWidget(group)
+            toolpalette.addWidget(panel, True)
 
     def _manual_counter_config(self, counter_name):
         widgets = self.manual_counter_widgets[counter_name]
@@ -460,15 +473,10 @@ class NI_DAQmxTab(DeviceTab):
         widgets = self.manual_counter_widgets[counter_name]
         config = widgets['config']
         sample_clock = config['sample_clock']
-        factor = config['multiplication_factor']
         if sample_clock == 'connection_table':
-            text = "latest = diff * %.6g" % factor
+            text = "Count difference (external clock; timing unknown)"
         else:
-            rate = config['rate']
-            text = (
-                "latest = diff / (1 / %.6g Hz) * %.6g = diff * %.6g * %.6g"
-                % (rate, factor, rate, factor)
-            )
+            text = "Count rate = difference × %.6g Hz" % config['rate']
         widgets['formula'].setText(text)
 
     def _ensure_manual_counter_monitor(self):
@@ -479,7 +487,7 @@ class NI_DAQmxTab(DeviceTab):
         if not self.manual_counter_active:
             self.statemachine_timeout_remove(self.manual_counter_monitor)
 
-    @define_state(MODE_MANUAL, queue_state_indefinitely=True, delete_stale_states=True)
+    @define_state(MODE_MANUAL, queue_state_indefinitely=True, delete_stale_states=False)
     def start_manual_counter(self, counter_name):
         widgets = self.manual_counter_widgets[counter_name]
         config = self._manual_counter_config(counter_name)
@@ -502,7 +510,7 @@ class NI_DAQmxTab(DeviceTab):
         widgets['status'].setText(result.get('status', 'running'))
         self._ensure_manual_counter_monitor()
 
-    @define_state(MODE_MANUAL, queue_state_indefinitely=True, delete_stale_states=True)
+    @define_state(MODE_MANUAL, queue_state_indefinitely=True, delete_stale_states=False)
     def stop_manual_counter(self, counter_name):
         widgets = self.manual_counter_widgets[counter_name]
         result = {'status': 'stopped'}
@@ -527,11 +535,16 @@ class NI_DAQmxTab(DeviceTab):
             result = yield (
                 self.queue_work("counter_worker", "fetch_manual_counter", counter_name)
             )
+            if result.get('status') == 'stopped':
+                # The worker-side counter is gone, e.g. it failed to restart
+                # after a buffered shot:
+                self.manual_counter_active.discard(counter_name)
+                self._set_counter_running(counter_name, False)
+                self._remove_manual_counter_monitor_if_idle()
+                widgets['status'].setText('stopped')
+                continue
             if result.get('values'):
                 widgets['latest'].setText(
-                    "latest: %.6g" % result['latest_value']
-                )
-                widgets['moving_average'].setText(
-                    "moving average: %.6g" % result['moving_average']
+                    "%.6g %s" % (result['latest_value'], result.get('unit', 'counts'))
                 )
             widgets['status'].setText(result.get('status', 'running'))
