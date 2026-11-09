@@ -212,7 +212,24 @@ class PrawnDOWorker(Worker):
             dict: Dictonary with output channels as keys and values are boolean states
         """
         return {f'do{i:d}':((val >> i) & 1) for i in range(16)}
-    
+
+    def _save_output_state(self, h5file, device_name, group_name, values):
+        """Record a digital output state into the shot h5 file.
+
+        Stores the 16-bit word as ``value`` plus a per-channel ``doN`` attribute
+        on a subgroup of the device group. Overwrites any existing group of the
+        same name so repeated transitions stay consistent.
+        """
+        word = self._dict_to_int(values)
+        with h5py.File(h5file, 'r+') as f:
+            device_group = f['devices'][device_name]
+            if group_name in device_group:
+                del device_group[group_name]
+            grp = device_group.create_group(group_name)
+            grp.attrs['value'] = np.uint16(word)
+            for conn, val in values.items():
+                grp.attrs[conn] = int(val)
+
     def check_status(self):
         '''Checks operational status of the PrawnDO.
 
@@ -271,6 +288,13 @@ class PrawnDOWorker(Worker):
         if fresh:
             self.smart_cache = {'pulse_program':None}
 
+        # Persist the manual output state present immediately before the shot so
+        # the shot record is self-contained (e.g. which switches were held on).
+        # Done for every shot, including ones that do not drive the PrawnDO.
+        self._save_output_state(
+            h5file, device_name, 'output_state_before_shot', initial_values
+        )
+
         with h5py.File(h5file, 'r') as hdf5_file:
             group = hdf5_file['devices'][device_name]
             if 'pulse_program' not in group:
@@ -279,6 +303,21 @@ class PrawnDOWorker(Worker):
             self.device_properties = labscript_utils.properties.get(
                 hdf5_file, device_name, "device_properties")
             pulse_program = group['pulse_program'][()]
+            # Bit mask of channels the shot explicitly commanded. Absent on
+            # shots compiled before this feature -> treat all as commanded.
+            commanded_mask = int(group.attrs.get('commanded_mask', 0xFFFF))
+
+        # Optionally hold outputs the shot did not command at their pre-shot
+        # manual value instead of driving them to 0: replace the uncommanded
+        # bits of every instruction word with the current manual front-panel
+        # state. Commanded bits (including explicit go_low) are left as compiled.
+        if self.device_properties.get('hold_unused_outputs', False):
+            hold_mask = (~commanded_mask) & 0xFFFF
+            manual_held = self._dict_to_int(initial_values) & hold_mask
+            bit_sets = pulse_program['bit_sets'].astype(np.uint32)
+            pulse_program['bit_sets'] = (
+                (bit_sets & commanded_mask) | manual_held
+            ).astype(np.uint16)
 
         # configure clock from device properties
         ext = self.device_properties['external_clock']
@@ -325,7 +364,11 @@ class PrawnDOWorker(Worker):
                     self.intf.send_command_ok(f'set {i:x} {instr[0]:x} {instr[1]:x}')
                     self.smart_cache['pulse_program'][i] = instr
 
-        final_values = self._int_to_dict(pulse_program[-1][0])
+        # The appended stop instruction (last row) carries an ignored bit value
+        # of 0; the hardware holds the final *real* instruction. Report that so
+        # BLACS' front panel matches the device (no false local/remote
+        # divergence) and any retained outputs are recorded correctly.
+        final_values = self._int_to_dict(int(pulse_program['bit_sets'][-2]))
 
         # start program, waiting for beginning trigger from parent
         self.intf.send_command_ok('run')
