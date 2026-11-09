@@ -1,5 +1,7 @@
+import logging
 import os
 import sys
+import tempfile
 import types
 import unittest
 import threading
@@ -9,10 +11,7 @@ os.environ.setdefault('READTHEDOCS', 'True')
 import numpy as np
 
 from labscript import LabscriptError
-from labscript_devices.NI_DAQmx.labscript_devices import (
-    NI_DAQmx,
-    configure_manual_counter_online_monitor,
-)
+from labscript_devices.NI_DAQmx.labscript_devices import NI_DAQmx
 
 
 class CounterStub:
@@ -75,23 +74,6 @@ class TestCounterPFIReservations(unittest.TestCase):
         self.assertEqual(table['manual rate'][0], 10.0)
         self.assertEqual(table['manual buffer size'][0], 1024)
         self.assertEqual(table['manual polling interval'][0], 0.1)
-        self.assertFalse(table['manual online monitor enabled'][0])
-        self.assertEqual(table['manual online monitor tags'][0], b'')
-
-    def test_manual_counter_online_monitor_config_goes_in_table(self):
-        device = self.make_device()
-        counter = CounterStub(name='counts', edge='PFI0', sample='PFI1')
-        configure_manual_counter_online_monitor(
-            counter,
-            enabled=True,
-            tags='source=test_counter,unit=counts_per_second',
-        )
-        table = device._make_counter_declaration_table({'ctr0': counter})
-        self.assertTrue(table['manual online monitor enabled'][0])
-        self.assertEqual(
-            table['manual online monitor tags'][0],
-            b'source=test_counter,unit=counts_per_second',
-        )
 
     def test_buffered_counter_acquisitions_cannot_duplicate_ctr(self):
         device = self.make_device()
@@ -114,85 +96,94 @@ class TestCounterPFIReservations(unittest.TestCase):
             device._make_counter_input_table({'ctr0': counter})
 
 
+def _stub_module(name):
+    if name in sys.modules:
+        return sys.modules[name]
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    return module
+
+
+def _ensure_blacs_stub():
+    try:
+        import blacs.tab_base_classes  # noqa: F401
+        import blacs.device_base_class  # noqa: F401
+    except Exception:
+        pass
+    _stub_module('blacs')
+    tab_base_classes = _stub_module('blacs.tab_base_classes')
+    device_base_class = _stub_module('blacs.device_base_class')
+
+    if not hasattr(tab_base_classes, 'Worker'):
+        class Worker:
+            pass
+
+        tab_base_classes.Worker = Worker
+    if not hasattr(tab_base_classes, 'MODE_MANUAL'):
+        tab_base_classes.MODE_MANUAL = 1
+    if not hasattr(tab_base_classes, 'define_state'):
+        def define_state(*args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+        tab_base_classes.define_state = define_state
+    if not hasattr(device_base_class, 'DeviceTab'):
+        class DeviceTab:
+            pass
+
+        device_base_class.DeviceTab = DeviceTab
+
+
+def _ensure_pydaqmx_stub():
+    try:
+        import PyDAQmx  # noqa: F401
+        return
+    except Exception:
+        pass
+    pydaqmx = _stub_module('PyDAQmx')
+    for submodule_name in ('DAQmxConstants', 'DAQmxTypes', 'DAQmxCallBack'):
+        submodule = _stub_module('PyDAQmx.' + submodule_name)
+        setattr(pydaqmx, submodule_name, submodule)
+
+
+def _ensure_qtutils_stub():
+    try:
+        from qtutils.qt import QtWidgets  # noqa: F401
+        return
+    except Exception:
+        pass
+    _stub_module('qtutils')
+    qtutils_qt = _stub_module('qtutils.qt')
+    if not hasattr(qtutils_qt, 'QtWidgets'):
+        qtutils_qt.QtWidgets = object()
+
+
 def import_counter_worker():
-    pythonlib = types.ModuleType('pythonlib')
-    data_saver = types.ModuleType('pythonlib.data_saver')
-    online_monitor = types.ModuleType('pythonlib.online_monitor')
-
-    class DataSaver:
-        pass
-
-    class OnlineMonitor:
-        pass
-
-    data_saver.DataSaver = DataSaver
-    online_monitor.OnlineMonitor = OnlineMonitor
-    sys.modules.setdefault('pythonlib', pythonlib)
-    sys.modules.setdefault('pythonlib.data_saver', data_saver)
-    sys.modules.setdefault('pythonlib.online_monitor', online_monitor)
+    _ensure_pydaqmx_stub()
+    _ensure_blacs_stub()
 
     from labscript_devices.NI_DAQmx.blacs_workers import NI_DAQmxCounterWorker
 
     return NI_DAQmxCounterWorker
 
 
-def import_counter_worker_module():
-    import_counter_worker()
-    import labscript_devices.NI_DAQmx.blacs_workers as blacs_workers
-
-    return blacs_workers
-
-
 def import_counter_tab():
-    blacs = types.ModuleType('blacs')
-    device_base_class = types.ModuleType('blacs.device_base_class')
-    tab_base_classes = types.ModuleType('blacs.tab_base_classes')
-    qtutils = types.ModuleType('qtutils')
-    qtutils_qt = types.ModuleType('qtutils.qt')
-
-    class DeviceTab:
-        pass
-
-    def define_state(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-
-    device_base_class.DeviceTab = DeviceTab
-    tab_base_classes.MODE_MANUAL = 1
-    tab_base_classes.define_state = define_state
-    qtutils_qt.QtWidgets = object()
-
-    sys.modules.setdefault('blacs', blacs)
-    sys.modules.setdefault('blacs.device_base_class', device_base_class)
-    sys.modules.setdefault('blacs.tab_base_classes', tab_base_classes)
-    sys.modules.setdefault('qtutils', qtutils)
-    sys.modules.setdefault('qtutils.qt', qtutils_qt)
+    _ensure_blacs_stub()
+    _ensure_qtutils_stub()
 
     from labscript_devices.NI_DAQmx.blacs_tabs import NI_DAQmxTab
 
+    import inspect
+    for name in ('manual_counter_monitor',):
+        method = getattr(NI_DAQmxTab, name)
+        original = inspect.getclosurevars(method).nonlocals.get('function')
+        if original is not None:
+            setattr(NI_DAQmxTab, name, original)
     return NI_DAQmxTab
 
 
 class TestManualCounterProcessing(unittest.TestCase):
-    def test_online_monitor_tags_parse_key_value_string(self):
-        worker_module = import_counter_worker_module()
-        self.assertEqual(
-            worker_module._parse_online_monitor_tags(
-                'source=test_counter, unit=counts_per_second'
-            ),
-            {'source': 'test_counter', 'unit': 'counts_per_second'},
-        )
-
-    def test_online_monitor_tags_parse_json_string(self):
-        worker_module = import_counter_worker_module()
-        self.assertEqual(
-            worker_module._parse_online_monitor_tags(
-                '{"source": "test_counter", "unit": "counts_per_second"}'
-            ),
-            {'source': 'test_counter', 'unit': 'counts_per_second'},
-        )
-
     def test_manual_counter_values_wait_for_two_counts_without_previous(self):
         worker_class = import_counter_worker()
         worker = object.__new__(worker_class)
@@ -312,6 +303,128 @@ class TestManualCounterProcessing(unittest.TestCase):
         with self.assertRaises(StopIteration):
             generator.send({'status': 'running', 'samples_read': 1})
         self.assertEqual(texts, {'status': 'running'})
+
+
+class TestManualCounterSuspendResume(unittest.TestCase):
+    def test_transition_to_buffered_suspends_manual_counters(self):
+        worker_class = import_counter_worker()
+        import labscript_utils.h5_lock
+        import h5py
+
+        worker = object.__new__(worker_class)
+        worker.logger = logging.getLogger('test')
+        worker.tasklock = threading.RLock()
+        worker.manual_counters = {
+            'counts': {
+                'counter': {'connection': 'ctr0'},
+                'config': {'rate': 10.0},
+            },
+        }
+        stopped = []
+
+        def stop_manual_counter(counter_name):
+            stopped.append(counter_name)
+            worker.manual_counters.pop(counter_name, None)
+
+        worker.stop_manual_counter = stop_manual_counter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            h5file = os.path.join(tmpdir, 'shot.h5')
+            with h5py.File(h5file, 'w') as f:
+                f.create_group('/devices/DevTest')
+            worker.transition_to_buffered('DevTest', h5file, {}, False)
+
+        self.assertEqual(stopped, ['counts'])
+        self.assertEqual(
+            worker.suspended_manual_counters,
+            [('counts', {'connection': 'ctr0'}, {'rate': 10.0})],
+        )
+
+    def test_transition_to_manual_restarts_suspended_counters(self):
+        worker_class = import_counter_worker()
+        worker = object.__new__(worker_class)
+        worker.logger = logging.getLogger('test')
+        worker.buffered_mode = False
+        worker.suspended_manual_counters = [
+            ('counts', {'connection': 'ctr0'}, {'rate': 10.0}),
+        ]
+        started = []
+
+        def start_manual_counter(counter_name, counter, config):
+            started.append((counter_name, counter, config))
+            return {'status': 'running'}
+
+        worker.start_manual_counter = start_manual_counter
+
+        self.assertTrue(worker.transition_to_manual())
+        self.assertEqual(
+            started, [('counts', {'connection': 'ctr0'}, {'rate': 10.0})]
+        )
+        self.assertEqual(worker.suspended_manual_counters, [])
+
+    def test_transition_to_manual_logs_failed_restarts(self):
+        worker_class = import_counter_worker()
+        worker = object.__new__(worker_class)
+        worker.logger = logging.getLogger('test')
+        worker.buffered_mode = False
+        worker.suspended_manual_counters = [
+            ('counts', {'connection': 'ctr0'}, {'rate': 10.0}),
+        ]
+
+        def start_manual_counter(counter_name, counter, config):
+            raise RuntimeError('resource in use')
+
+        worker.start_manual_counter = start_manual_counter
+
+        self.assertTrue(worker.transition_to_manual())
+        self.assertEqual(worker.suspended_manual_counters, [])
+
+    def test_manual_counter_monitor_syncs_stopped_counter(self):
+        tab_class = import_counter_tab()
+        tab = object.__new__(tab_class)
+        tab.manual_counter_active = {'counts'}
+        texts = {}
+        enabled = {}
+        removed = []
+
+        class Label:
+            def __init__(self, name):
+                self.name = name
+
+            def setText(self, text):
+                texts[self.name] = text
+
+        class Button:
+            def __init__(self, name):
+                self.name = name
+
+            def setEnabled(self, state):
+                enabled[self.name] = state
+
+        tab.manual_counter_widgets = {
+            'counts': {
+                'latest': Label('latest'),
+                'moving_average': Label('moving_average'),
+                'status': Label('status'),
+                'start': Button('start'),
+                'stop': Button('stop'),
+            }
+        }
+        tab.statemachine_timeout_remove = lambda func: removed.append(func)
+
+        def queue_work(worker, method, *args):
+            return {'status': 'stopped', 'samples_read': 0}
+
+        tab.queue_work = queue_work
+        generator = tab.manual_counter_monitor()
+
+        next(generator)
+        with self.assertRaises(StopIteration):
+            generator.send({'status': 'stopped', 'samples_read': 0})
+        self.assertEqual(tab.manual_counter_active, set())
+        self.assertEqual(texts, {'status': 'stopped'})
+        self.assertEqual(enabled, {'start': True, 'stop': False})
+        self.assertEqual(removed, [tab.manual_counter_monitor])
 
 
 if __name__ == '__main__':
