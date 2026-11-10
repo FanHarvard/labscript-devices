@@ -13,8 +13,6 @@
 import sys
 import time
 import threading
-import socket
-from collections import deque
 from PyDAQmx import *
 from PyDAQmx.DAQmxConstants import *
 from PyDAQmx.DAQmxTypes import *
@@ -769,23 +767,32 @@ class NI_DAQmxCounterWorker(Worker):
         self.data_buffer = []
         self.daq_status = []
         self.data_saver = []
-        self.buffered_streams = []
-        self.buffered_rate_scales = []
-        self.buffered_prev_counts = []
+        self.counter_streams = []
 
         self.tasks = []
         self.thread_polling_data = []
         self.event_task_stopped = None
         self.manual_counters = {}
+        # Manual counters stopped for a buffered shot, to be restarted in
+        # transition_to_manual:
+        self.suspended_manual_counters = []
 
     def shutdown(self):
         for counter_name in list(self.manual_counters):
             self.stop_manual_counter(counter_name)
-        if len(self.tasks) > 0:
+        self.suspended_manual_counters = []
+        if self.buffered_mode:
+            self.transition_to_manual(abort=True)
+        elif self.tasks:
             self._stop_task()
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.logger.debug('transition_to_buffered')
+        with self.tasklock:
+            self.suspended_manual_counters = [
+                (counter_name, state['counter'], state['config'])
+                for counter_name, state in self.manual_counters.items()
+            ]
         for counter_name in list(self.manual_counters):
             self.stop_manual_counter(counter_name)
 
@@ -795,30 +802,23 @@ class NI_DAQmxCounterWorker(Worker):
             if 'CI' not in group:
                 return initial_values
             ci_table = group['CI'][:]
-            counters_table = group['COUNTERS'][:] if 'COUNTERS' in group else None
-
-        # Per-channel FastMonitor/OnlineMonitor specs from the counter
-        # declarations, keyed by counter connection:
-        monitors_by_connection = {}
-        if (counters_table is not None
-                and 'monitors json' in counters_table.dtype.names):
-            for row in counters_table:
-                try:
-                    spec = json.loads(
-                        _ensure_str(row['monitors json']) or '{}'
-                    )
-                except ValueError:
-                    spec = {}
-                monitors_by_connection[_ensure_str(row['connection'])] = spec
+            declarations = {}
+            if 'COUNTERS' in group:
+                for declaration in group['COUNTERS'][:]:
+                    if 'monitor' not in declaration.dtype.names:
+                        raise RuntimeError("Recompile the connection table with ChannelMonitor support")
+                    declarations[_ensure_str(declaration['connection'])] = {
+                        'name': _ensure_str(declaration['name']),
+                        'monitor': json.loads(_ensure_str(declaration['monitor'])),
+                    }
 
         self.instructions = []
         self.buffered_chans = []
         self.data_buffer = []
         self.daq_status = []
         self.data_saver = []
-        self.buffered_streams = []
-        self.buffered_rate_scales = []
-        self.buffered_prev_counts = []
+        self.counter_streams = []
+        self.previous_counts = []
 
         for i_task, row in enumerate(ci_table):
             self.instructions.append(
@@ -834,6 +834,15 @@ class NI_DAQmxCounterWorker(Worker):
                 }
             )
             instruction = self.instructions[-1]
+            counter = declarations.get(instruction['connection'], {})
+            self.counter_streams.append(MonitorStreams.from_config(
+                counter.get('monitor'),
+                identity={'device_name': self.device_name,
+                          'channel': counter.get('name', instruction['connection']),
+                          'mode': 'buffered', 'shot_file': Path(self.h5_file).stem},
+                logger=self.logger, measurement='count',
+            ))
+            self.previous_counts.append(None)
 
             self.buffered_chans.append(instruction["connection"])
             self.data_buffer.append(np.zeros((instruction["buffer_size"],), dtype=np.uint32))
@@ -847,28 +856,6 @@ class NI_DAQmxCounterWorker(Worker):
                 )
             )
             self.data_saver[-1].open_for_writing()
-            # A finite declared sample rate (labscript acquire() argument or
-            # a software-configured clock) makes a rate dataset possible.
-            declared_rate = float(instruction['max_sampling_rate'] or 0)
-            self.buffered_rate_scales.append(
-                declared_rate
-                if np.isfinite(declared_rate) and declared_rate > 0 else None
-            )
-            self.buffered_prev_counts.append(None)
-            self.buffered_streams.append(
-                MonitorStreams.from_config(
-                    monitors_by_connection.get(instruction["connection"]),
-                    identity={
-                        "device_name": self.device_name,
-                        "channel": instruction["connection"],
-                        "mode": "buffered",
-                        "shot_file": Path(self.h5_file).stem,
-                    },
-                    logger=self.logger,
-                    # The worker owns the measurement name.
-                    measurement="count",
-                )
-            )
         
         self.buffered_mode = True
         self._start_task(self.instructions)
@@ -881,6 +868,7 @@ class NI_DAQmxCounterWorker(Worker):
         self.logger.debug('[CounterWorker] transition_to_manual')
 
         if not self.buffered_mode:
+            self._restore_manual_counters()
             return True
         if len(self.buffered_chans) > 0:
             self._stop_task()
@@ -896,8 +884,13 @@ class NI_DAQmxCounterWorker(Worker):
             self.logger.debug(f"[CounterWorker] Close data file of {data_saver.data_label}")
             data_saver.close_data_file()
             self.logger.debug(f"[CounterWorker] Merge data in {data_saver.data_label} to the shot file")
-            data_saver.merge_into_shot()
+            if abort:
+                data_saver.cleanup()
+            else:
+                data_saver.merge_into_shot(cleanup=True)
 
+        acquisition_errors = [status['acquisition_error'] for status in self.daq_status
+                              if 'acquisition_error' in status]
         self.buffered_mode = False
         self.h5_file = None
         self.instructions = []
@@ -905,16 +898,30 @@ class NI_DAQmxCounterWorker(Worker):
         self.data_buffer = []
         self.daq_status = []
         self.data_saver = []
-        for streams in self.buffered_streams:
+        for streams in self.counter_streams:
             if streams is not None:
                 streams.close()
-        self.buffered_streams = []
-        self.buffered_rate_scales = []
-        self.buffered_prev_counts = []
+        self.counter_streams = []
+
+        self._restore_manual_counters()
 
         self.logger.info('transitioning to manual mode, task stopped')
-
+        if acquisition_errors and not abort:
+            raise RuntimeError('Counter acquisition failed: ' + '; '.join(acquisition_errors))
         return True
+
+    def _restore_manual_counters(self):
+        """Restart manual counters that were stopped in transition_to_buffered."""
+        suspended = self.suspended_manual_counters
+        self.suspended_manual_counters = []
+        for counter_name, counter, config in suspended:
+            try:
+                self.start_manual_counter(counter_name, counter, config)
+            except Exception:
+                self.logger.exception(
+                    "Failed to restart manual counter %s after buffered shot",
+                    counter_name,
+                )
 
     def abort_buffered(self):
         return self.transition_to_manual(True)
@@ -954,9 +961,12 @@ class NI_DAQmxCounterWorker(Worker):
         task.TaskControl(PyDAQmx.DAQmxConstants.DAQmx_Val_Task_Commit)
         return task
 
-    def _manual_counter_values(self, counts, previous_count):
-        """Raw per-sample count differences; any scaling or averaging is the
-        receiver's business."""
+    def _manual_counter_values(
+        self,
+        counts,
+        previous_count,
+        scale,
+    ):
         if len(counts) == 0:
             return np.array([], dtype=np.float64), previous_count
         if previous_count is None:
@@ -966,7 +976,9 @@ class NI_DAQmxCounterWorker(Worker):
         else:
             values = np.concatenate(([previous_count], counts.astype(np.int64)))
             diffs = np.diff(values)
-        return diffs.astype(np.float64), int(counts[-1])
+        # NI returns uint32 cumulative counts; account for rollover.
+        diffs %= 2**32
+        return diffs.astype(np.float64) * scale, int(counts[-1])
 
     def start_manual_counter(self, counter_name, counter, config):
         with self.tasklock:
@@ -989,6 +1001,9 @@ class NI_DAQmxCounterWorker(Worker):
             rate = float(config['rate'])
             buffer_size = int(config['buffer_size'])
             fetch_interval = max(0.02, float(config['polling_interval']))
+            monitor = counter.get('monitor') or {}
+            if monitor.get('fast'):
+                fetch_interval = max(0.02, float(monitor['fast']['poll_s']))
 
             if sample_clock == 'connection_table':
                 sample = counter['sample']
@@ -997,8 +1012,8 @@ class NI_DAQmxCounterWorker(Worker):
                         "Counter '%s' has no sample_terminal in the connection table"
                         % counter_name
                     )
+                scale = 1.0
                 sample_clock_rate = None
-                stream_scale = None  # external sample terminal: interval unknown
                 co_task = None
             else:
                 sample_clock = sample_clock.lower()
@@ -1017,7 +1032,7 @@ class NI_DAQmxCounterWorker(Worker):
                 co_task = self._create_counter_output_task(sample_clock, rate)
                 sample = self._counter_internal_output_terminal(sample_clock)
                 sample_clock_rate = rate
-                stream_scale = rate  # counts/sample -> counts/second
+                scale = rate
 
             inst = {
                 'connection': connection,
@@ -1030,31 +1045,24 @@ class NI_DAQmxCounterWorker(Worker):
             ci_task = PyDAQmx.Task()
             self._set_count_task(ci_task, inst)
 
-            # Per-channel streams from the Counter's monitor= argument.
-            monitor_streams = MonitorStreams.from_config(
-                (counter.get('monitors') if isinstance(counter, dict)
-                 else None),
-                identity={
-                    'device_name': self.device_name,
-                    'channel': connection,
-                    'mode': 'manual',
-                },
-                logger=self.logger,
-                # The worker owns the measurement name.
-                measurement='count',
-            )
-
             state = {
                 'counter': counter,
+                'config': dict(config),
                 'ci_task': ci_task,
                 'co_task': co_task,
                 'sample_clock': sample_clock,
                 'sample_clock_rate': sample_clock_rate,
-                'stream_scale': stream_scale,
+                'scale': scale,
                 'buffer': np.zeros((buffer_size,), dtype=np.uint32),
                 'daq_status': {},
                 'last_count': None,
-                'streams': monitor_streams,
+                'streams': MonitorStreams.from_config(
+                    counter.get('monitor'),
+                    identity={'device_name': self.device_name,
+                              'channel': counter_name, 'mode': 'manual'},
+                    logger=self.logger, measurement='count',
+                ),
+                'last_fetch': None,
                 'fetch_interval': fetch_interval,
             }
             self.manual_counters[counter_name] = state
@@ -1074,9 +1082,8 @@ class NI_DAQmxCounterWorker(Worker):
             state = self.manual_counters.pop(counter_name, None)
             if state is None:
                 return {'status': 'stopped'}
-            streams = state.get('streams')
-            if streams is not None:
-                streams.close()
+            if state.get('streams') is not None:
+                state['streams'].close()
             for task_name in ('co_task', 'ci_task'):
                 task = state[task_name]
                 if task is None:
@@ -1098,6 +1105,10 @@ class NI_DAQmxCounterWorker(Worker):
         if state is None:
             return {'status': 'stopped', 'samples_read': 0}
 
+        now = time.monotonic()
+        if state['last_fetch'] is not None and now - state['last_fetch'] < state['fetch_interval']:
+            return {'status': 'running', 'samples_read': 0}
+        state['last_fetch'] = now
         samples_read = self._read_data(
             state['ci_task'],
             PyDAQmx.DAQmxConstants.DAQmx_Val_Auto,
@@ -1110,14 +1121,13 @@ class NI_DAQmxCounterWorker(Worker):
 
         counts = np.array(state['buffer'][:samples_read], copy=True)
         values, state['last_count'] = self._manual_counter_values(
-            counts, state['last_count']
+            counts, state['last_count'], state['scale']
         )
-        if state.get('stream_scale'):
-            values = values * float(state['stream_scale'])
-        now_ns = time.time_ns()
-        for value in values:
-            if state.get('streams') is not None:
-                state['streams'].send(float(value), timestamp_ns=now_ns)
+        streams = state['streams']
+        if streams is not None:
+            rate = state['sample_clock_rate']
+            streams.send_many(values, interval_ns=1e9 / rate if rate else None)
+
         if len(values) == 0:
             return {'status': 'running', 'samples_read': samples_read}
 
@@ -1125,13 +1135,13 @@ class NI_DAQmxCounterWorker(Worker):
         status = 'running'
         if state['daq_status'].get('has_overflow'):
             status = 'running (overflow)'
-        if state.get('streams') is not None:
-            for kind, message in state['streams'].errors().items():
-                status = 'running (%s monitor error: %s)' % (kind, message)
+        if streams is not None and streams.errors():
+            status = 'running (monitor: %s)' % streams.errors()
         return {
             'status': status,
             'samples_read': samples_read,
             'latest_value': latest,
+            'unit': 'counts/s' if state['sample_clock_rate'] else 'counts',
             'values': [float(value) for value in values],
         }
 
@@ -1156,90 +1166,49 @@ class NI_DAQmxCounterWorker(Worker):
                 return 0
             raise
 
+    def _save_counter_samples(self, i_task, data):
+        """Save authoritative counts and stream the rate when timing is known."""
+        if not len(data):
+            return
+        saver = self.data_saver[i_task]
+        f = saver.get_open_file()
+        if f is None:
+            raise RuntimeError("Counter sidecar is not open")
+
+        def append(name, values):
+            if name not in f:
+                return f.create_dataset(name, data=values, maxshape=(None,), chunks=True)
+            ds = f[name]
+            start = len(ds)
+            ds.resize((start + len(values),))
+            ds[start:] = values
+            return ds
+
+        append('data', data)
+        rate = self.instructions[i_task]['max_sampling_rate']
+        known_rate = np.isfinite(rate) and rate > 0
+        values = data
+        if known_rate:
+            values, self.previous_counts[i_task] = self._manual_counter_values(
+                data, self.previous_counts[i_task], rate)
+            append('rate', values).attrs['sample_rate_hz'] = rate
+        streams = self.counter_streams[i_task]
+        if streams is not None:
+            streams.send_many(values, interval_ns=1e9 / rate if known_rate else None)
+
     def _poll_data(self, i_task: int, interval: float):
-        while not self.event_task_stopped.is_set():
-            rate_values = None
-            samples_read = self._read_data(
-                self.tasks[i_task],
-                PyDAQmx.DAQmxConstants.DAQmx_Val_Auto,
-                0,
-                self.data_buffer[i_task],
-                self.daq_status[i_task],
-            )
-
-            if samples_read > 0:
-                data = np.array(self.data_buffer[i_task][:samples_read], copy=True)
-                saver = self.data_saver[i_task]
-
-                # 'rate' companion values (counts/s) when the sample timing is
-                # known; the raw cumulative 'data' dataset is always written.
-                rate_scale = self.buffered_rate_scales[i_task]
-                rate_values = None
-                if rate_scale:
-                    diffs, self.buffered_prev_counts[i_task] = (
-                        self._manual_counter_values(
-                            data, self.buffered_prev_counts[i_task]
-                        )
-                    )
-                    if len(diffs):
-                        rate_values = diffs * rate_scale
-
-                def _append(f, name, values, attrs=None):
-                    if name not in f:
-                        ds = f.create_dataset(
-                            name,
-                            data=values,
-                            maxshape=(None,),
-                            chunks=True,
-                            dtype=values.dtype,
-                        )
-                        for key, value in (attrs or {}).items():
-                            ds.attrs[key] = value
-                    else:
-                        ds = f[name]
-                        old_len = ds.shape[0]
-                        ds.resize((old_len + len(values),))
-                        ds[old_len:] = values
-
-                data_save_succeeded = False
-                max_trial = 8
-                wait_interval_between_trial = 0.05
-                trial = 0
-                while not data_save_succeeded and trial < max_trial:
-                    f = saver.get_open_file()
-                    if f is None:
-                        time.sleep(wait_interval_between_trial)
-                        trial += 1
-                        continue
-                    _append(f, "data", data)
-                    if rate_values is not None:
-                        _append(
-                            f, "rate", rate_values,
-                            attrs={"sample_rate_hz": float(rate_scale)},
-                        )
-                    data_save_succeeded = True
-                if not data_save_succeeded:
-                    raise RuntimeError("[NI_DAQmxCounter] failed to save data after {max_trial} attempts. Data was lost.")
-
-            streams = (
-                self.buffered_streams[i_task]
-                if i_task < len(self.buffered_streams) else None
-            )
-            if samples_read > 0 and streams is not None:
-                # Stream rates when the sample timing is known; otherwise the
-                # cumulative edge counts as recorded (receivers difference
-                # them themselves, e.g. in Grafana).
-                if rate_values is not None and len(rate_values):
-                    streams.send_many(
-                        rate_values,
-                        interval_ns=interval * 1e9 / len(rate_values),
-                    )
-                elif self.buffered_rate_scales[i_task] is None:
-                    streams.send_many(
-                        self.data_buffer[i_task][:samples_read],
-                        interval_ns=interval * 1e9 / samples_read,
-                    )
-            time.sleep(interval)
+        try:
+            while not self.event_task_stopped.is_set():
+                samples_read = self._read_data(
+                    self.tasks[i_task], PyDAQmx.DAQmxConstants.DAQmx_Val_Auto,
+                    0, self.data_buffer[i_task], self.daq_status[i_task],
+                )
+                self._save_counter_samples(
+                    i_task, np.array(self.data_buffer[i_task][:samples_read], copy=True))
+                self.event_task_stopped.wait(interval)
+        except Exception as exc:
+            self.daq_status[i_task]['acquisition_error'] = str(exc)
+            self.logger.exception("Counter acquisition failed")
 
     def _set_count_task(self, task, inst):
         """Set count task.
@@ -1324,7 +1293,8 @@ class NI_DAQmxCounterWorker(Worker):
                     if read_sample_size == 0:
                         query_sample_size -= 1
                     else:
-                        break
+                        self._save_counter_samples(
+                            i_task, np.array(data_buffer[:read_sample_size], copy=True))
 
                 self.logger.debug(f'[CounterWorker] Finished reading data from task {i_task}')
 

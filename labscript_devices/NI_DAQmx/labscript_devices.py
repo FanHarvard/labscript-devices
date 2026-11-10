@@ -31,6 +31,7 @@ from labscript import (
 from labscript_utils import dedent
 from .utils import split_conn_DO, split_conn_AO, split_conn_AI, split_conn_CI
 import json
+import h5py
 import numpy as np
 import warnings
 
@@ -712,9 +713,15 @@ class NI_DAQmx(IntermediateDevice):
                     ">= 0.02 s" % connection
                 )
             if buffer_size < 1:
+                raise LabscriptError("Counter buffer_size must be at least 1")
+            legacy = set(manual_config) & {
+                'udp_host', 'udp_port', 'multiplication_factor', 'average_count',
+                'online_monitor_enabled', 'online_monitor_tags',
+            }
+            if legacy:
                 raise LabscriptError(
-                    "Manual counter acquisition for %s requires buffer_size >= 1"
-                    % connection
+                    "Legacy counter settings %s: use Counter(monitor=ChannelMonitor(...))"
+                    % sorted(legacy)
                 )
             return {
                 'enabled': bool(manual_config.get('enabled', True)),
@@ -723,12 +730,6 @@ class NI_DAQmx(IntermediateDevice):
                 'buffer_size': buffer_size,
                 'polling_interval': polling_interval,
             }
-
-        def monitors_json(counter):
-            monitor = getattr(counter, 'monitor', None)
-            if monitor is None:
-                return '{}'
-            return json.dumps(monitor.to_dict())
 
         counter_dtypes = [
             ('name', 'S256'),
@@ -741,9 +742,7 @@ class NI_DAQmx(IntermediateDevice):
             ('manual rate', 'f8'),
             ('manual buffer size', 'u4'),
             ('manual polling interval', 'f8'),
-            # ChannelMonitor spec of the Counter's monitor= argument (JSON),
-            # used in both manual and buffered modes.
-            ('monitors json', 'S1024'),
+            ('monitor', h5py.string_dtype(encoding='utf-8')),
         ]
         counter_table = np.empty(len(counters), dtype=counter_dtypes)
         for i, (connection, counter) in enumerate(sorted(counters.items())):
@@ -759,7 +758,7 @@ class NI_DAQmx(IntermediateDevice):
                 manual_config.get('rate', 10.0),
                 manual_config.get('buffer_size', 1024),
                 manual_config.get('polling_interval', 0.1),
-                monitors_json(counter),
+                json.dumps(getattr(counter, 'monitor', None)),
             )
         return counter_table
 
